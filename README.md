@@ -19,7 +19,9 @@ Built for a specific annoyance: you buy an ebook, load it onto a Kobo, and the p
   - [`classes`](#classes)
   - [`outline`](#outline)
   - [`cover`](#cover)
+  - [`verify`](#verify)
 - [The plan file](#the-plan-file)
+- [Producer recipes](#producer-recipes)
 - [Recipes](#recipes)
 - [Verifying the result](#verifying-the-result)
 - [Getting it onto a Kobo](#getting-it-onto-a-kobo)
@@ -57,16 +59,24 @@ Optional but strongly recommended: **Calibre**, for its `ebook-edit` book editor
 ## Quick start
 
 ```bash
-# 1. Look at the book's structure and propose chapter boundaries
-uv run epubfix.py scan "book.epub" -o plan.json
+# 1. Work out how this book marks its chapters, and propose boundaries
+uv run epubfix.py scan "book.epub" --auto -o plan.json
 
-# 2. Open plan.json and review. Disable false positives, fix titles, set levels.
+# 2. Open plan.json and review. Everything carries a confidence score and a
+#    reason; the console listing puts the doubtful cases first.
 
-# 3. Apply
+# 3. Apply, then check the result against the original
 uv run epubfix.py apply "book.epub" plan.json -o "book-fixed.epub"
+uv run epubfix.py verify "book-fixed.epub" "book.epub"
 ```
 
-If step 1 finds nothing useful, the book probably has no real headings. Use [`classes`](#classes) to discover how its chapters are actually marked up, then re-scan with a selector.
+`--auto` looks at which paragraph style tends to be followed by the first
+paragraph of a chapter, and proposes the two or three markers that behave that
+way. It prints each proposal as the explicit command line that would reproduce
+it, so you can take one, adjust a regex and re-run by hand.
+
+Without `--auto`, `scan` behaves as it always has: `h1`-`h4`, or whatever you
+pass to `--select`, `--class-regex` and `--id-regex`.
 
 ---
 
@@ -92,10 +102,48 @@ uv run epubfix.py scan BOOK.epub -o plan.json [options]
 | `--include-preceding-into` | Restrict `--include-preceding` to split points whose own class matches. |
 | `--title-extend` | Fold following sibling blocks' text into the ToC title. |
 | `--title-sep` | Separator used by `--title-extend`. Default `" - "`. |
+| `--auto` | Discover the chapter marker and write a plan using it. |
+| `--propose` | Print ranked marker proposals without committing to one. |
+| `--from-toc` | Build the plan from the book's own navigation anchors instead of detecting headings. |
+| `--threshold` | Confidence at or above which a candidate is `"split": true`. Default `0.5`. |
+| `--verbose` / `--show-above` | Show every candidate, rather than only those below `0.95` confidence. |
+| `--recipes` / `--save-recipe` | Reuse, or record, a per-producer recipe. See [Producer recipes](#producer-recipes). |
 
 The header output tells you the spine document count, whether a page map is present, and the current table of contents. Then each spine document is listed with its candidates.
 
 Lines prefixed `-` are candidates that failed `--require-following`; they are written to the plan as `"split": false` rather than dropped, so you can review and re-enable them. A `<-N` marker means `--include-preceding` moved that split point back N positions.
+
+Each candidate carries a confidence score and the reasoning behind it:
+
+```
+  - 0.15 pos=1506   L1 div class=blockquote  '“A wind has blown the land away…'
+        [prose follows, but not a chapter-opening style; no attribution — reads as an in-scene quotation]
+    1.00 pos=1959   L1 div class=blockquote  'Empires do not suffer emptiness of purpose…'
+        [opens with p.noindent; run of body text follows; carries an attribution]
+```
+
+What the score is built from, in rough order of how much it decides:
+
+- **What follows the marker.** A chapter opener is followed by the chapter's
+  first paragraph. Where a book has a distinct style for that paragraph, prose
+  in any *other* style is positive evidence that the marker sits mid-scene.
+- **Attribution.** A chapter epigraph is quoted from somewhere and says so
+  (`—Ancient Fremen Saying`); a song a character overhears is not attributed.
+  This separates the two where the paragraph-style test cannot, because both
+  are followed by ordinary prose. Only used when the marker style is
+  sometimes-but-not-always attributed, since a constant tells you nothing.
+- **`page-break-before` in the book's own stylesheet.** A publisher forcing a
+  page break is stating that a section begins. It applies to every occurrence
+  of the style equally, so it acts as a floor rather than a bonus — it is what
+  keeps front matter whose body is a list or a poem rather than prose
+  ("Cast", "Contents") in the table of contents.
+- **Text shape.** `Chapter 7`, a bare numeral or a roman numeral.
+- **Ornaments and empty markers** are rejected outright.
+
+Deliberately *not* used: how evenly spaced the candidates are. It is the
+obvious idea and it does not work — measured against a book fixed by hand,
+real chapters ranged from 4.5K to 26K characters, and a "too close together"
+rule flagged two real chapters while missing two of the three interior songs.
 
 > **PowerShell note.** PowerShell discards empty-string arguments before the script sees them, so `--select ""` fails. Use `--no-tags` instead (or `--select none`).
 
@@ -163,6 +211,63 @@ Responsive values such as `width="100%"` are left alone; only absolute pixel dim
 
 > **This only fixes the cover inside the EPUB.** Calibre keeps its own library cover, and the Kobo driver builds the device thumbnail from *that*. After running this, also set the cover in Calibre via **Edit metadata**, or the home-screen tile will still show the old art.
 
+### `verify`
+
+Checks a fixed book against the guarantees this tool claims, and against the
+book it came from.
+
+```bash
+uv run epubfix.py verify BOOK-FIXED.epub [BOOK.epub]
+```
+
+```
+prose unchanged  424,253 characters, identical
+links resolve    every internal href found its target
+toc              31 entries, all resolve
+spine            31 documents, each present exactly once
+page map         gone
+archive          mimetype first and stored
+
+OK - all checks passed.
+```
+
+Give it the original as a second argument and it also confirms that not one
+word moved: all body text in spine order, whitespace-normalised, must be
+identical. Exit status is non-zero on failure, so it drops into a script.
+
+This does not replace Calibre's Check Book — that knows about EPUB conformance
+in general, this knows what *this tool* was supposed to do and did not.
+
+---
+
+## Producer recipes
+
+Books from one imprint come out of one toolchain, so the marker that worked for
+the last one usually works for the next.
+
+```bash
+# after reviewing and correcting a plan
+uv run epubfix.py scan "book.epub" --auto -o plan.json --save-recipe recipes.json
+
+# next book from the same publisher
+uv run epubfix.py scan "other.epub" --auto -o plan.json --recipes recipes.json
+```
+
+```
+Fingerprint  : unknown/6d426219503d  (62 styles)
+               matches Dune Messiah.epub (93% style overlap), saved 2026-09-07:
+               split on div.blockquote
+```
+
+The recipe is distilled from the *plan*, not from the proposal, so what gets
+stored is whatever you decided — including decisions no heuristic made.
+
+Matching is by similarity rather than by hash. Two titles from one imprint are
+built from the same template but rarely ship identical stylesheets: the two
+Gollancz books this was tested on declare 67 and 62 classes. Their class
+vocabularies overlap 93% while sharing 1% with an InDesign export, so set
+overlap identifies the family reliably where equality would never match at all.
+
 ---
 
 ## The plan file
@@ -189,6 +294,7 @@ Plain JSON, meant to be read and edited. One entry per candidate:
 | `pos` | Where the file will be cut, in document order. |
 | `heading_pos` | Where the heading itself is. Differs from `pos` when `--include-preceding` moved the cut earlier. |
 | `class`, `tag`, `id`, `depth` | Identifying context, so you can bulk-edit by find-and-replace. |
+| `score`, `why` | Confidence in [0,1] and the reasoning behind it. Informational — `apply` reads `split`. |
 | `split` | **Edit this.** `false` leaves the text in place and creates no entry. |
 | `level` | **Edit this.** `1` for top-level, `2` to nest under the preceding level-1 entry. |
 | `title` | **Edit this.** The table-of-contents label. |
@@ -198,6 +304,18 @@ Because `class` is included in every record, disabling a whole category of false
 ---
 
 ## Recipes
+
+**Try this first, whatever the book**
+
+```bash
+uv run epubfix.py scan "book.epub" --auto -o plan.json
+```
+
+On the three books this was developed against — a Gollancz SF Gateway title
+split on epigraphs, one already split but misnamed, and an InDesign export
+needing 114 splits and two ToC levels — `--auto` followed by `apply` reproduces
+the hand-made fix exactly, with no flags. That will not hold for every book,
+which is why the plan file still exists.
 
 **Real headings, straightforward book**
 
@@ -278,7 +396,22 @@ If you use the KoboTouchExtended driver, turn on its option to copy the generate
 **Limitations:**
 
 - No DRM handling of any kind. The book must open in Calibre's editor.
-- Chapter detection is not automatic and is not meant to be. Publishers are too inconsistent, and a wrong split silently corrupts structure. The plan file exists so a human makes the call.
+- Chapter detection proposes; it does not decide. `--auto` is good enough to reproduce three hand-made fixes exactly, but publishers are inconsistent and a wrong split silently corrupts structure, so the plan file still exists and is still worth reading. The confidence scores exist to tell you *where* to look, not to spare you looking.
+- The scoring was tuned against three books. It is a considered set of features rather than a fitted model, but three books is three books — run `verify`, and read the low-confidence end of the plan.
 - Split points must be siblings within the same parent for `--include-preceding` and `--require-following` to work, which is the normal case but not guaranteed.
 - `image_size` understands PNG, JPEG, and GIF. A WebP or SVG cover will be swapped in but its SVG wrapper will not be resized.
-- Tested against InDesign exports, Gollancz SF Gateway titles, and hand-built fixtures covering nested wrappers, endnote round-trips, mixed inline content, and both cover-declaration conventions. Not exhaustively tested against every producer in existence — always run Check Book on the output.
+- Tested against InDesign exports, Gollancz SF Gateway titles, and hand-built fixtures covering nested wrappers, endnote round-trips, mixed inline content, and both cover-declaration conventions. Not exhaustively tested against every producer in existence — always run `verify`, and Check Book, on the output.
+
+## Regression tests
+
+`tests/regression.py` runs the automatic pipeline over a corpus of books that
+were repaired by hand, and requires the result to match the hand-made fix entry
+for entry. The books are purchased files and are not in the repository, so
+point it at a directory holding them:
+
+```bash
+uv run tests/regression.py --corpus ../epubs
+```
+
+It also keeps one known-bad file — a discarded intermediate run — and requires
+`verify` to reject it, so the safety net is itself checked.
