@@ -389,7 +389,7 @@ If you use the KoboTouchExtended driver, turn on its option to copy the generate
 
 ## Guarantees and limitations
 
-**What is never modified:** the prose. No reflowing, restyling, or rewording. The only mutations are file boundaries, href targets, the OPF manifest and spine, and the two navigation documents. A document that does not need dividing is passed through byte-for-byte rather than reserialized.
+**What is never modified:** the prose. No reflowing, restyling, or rewording. The only mutations are file boundaries, href targets, the OPF manifest and spine, and the two navigation documents. A document that does not need dividing is passed through byte-for-byte rather than reserialised.
 
 **What is modified:** file names of split documents (`chapter001.html` becomes `chapter001_000.html` and so on), internal link targets that crossed a split, manifest and spine entries, `nav.xhtml`, `toc.ncx`, and — unless you pass `--keep-page-list` — the print page map.
 

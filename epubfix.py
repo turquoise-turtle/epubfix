@@ -47,7 +47,7 @@ WHY THE TEXT IS GUARANTEED UNTOUCHED
     structural: file boundaries, href targets, the OPF manifest/spine, and
     the two navigation documents. No reflowing, restyling, or rewording. A
     document that does not actually need dividing is passed through
-    byte-for-byte rather than reserialized, because a needless XML round-trip
+    byte-for-byte rather than reserialised, because a needless XML round-trip
     is a needless opportunity to lose something.
 
 WHY SPLITTING IS RISKIER THAN IT LOOKS
@@ -134,8 +134,8 @@ def parse_xml(data: bytes):
     return etree.fromstring(fix_entities(data), parser=parser)
 
 
-def serialize_xhtml(root) -> bytes:
-    """Serialize as XHTML, forcing non-void empty elements to a full tag pair.
+def serialise_xhtml(root) -> bytes:
+    """Serialise as XHTML, forcing non-void empty elements to a full tag pair.
 
     lxml writes an empty element as <div/>. That is valid XML, but some
     e-reader engines parse XHTML with an HTML parser, which treats <div/> as an
@@ -152,7 +152,7 @@ def serialize_xhtml(root) -> bytes:
                           doctype="<!DOCTYPE html>")
 
 
-def serialize_xml(root) -> bytes:
+def serialise_xml(root) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="utf-8")
 
 
@@ -1628,10 +1628,10 @@ def cmd_cover(book_path, image_path, out_path):
                             svg.set("height", str(nh))
                         changed = True
         if changed:
-            new_files[zname] = serialize_xhtml(r)
+            new_files[zname] = serialise_xhtml(r)
             fixed_pages.append(zname)
 
-    new_files[book.opf_path] = serialize_xml(book.opf)
+    new_files[book.opf_path] = serialise_xml(book.opf)
 
     # Rebuild the archive rather than editing in place: "mimetype" must be the
     # first entry and stored uncompressed for the file to be recognised as an
@@ -1850,7 +1850,7 @@ def cmd_apply(args):
         if len(parts) == 1:
             # Nothing actually needs dividing (e.g. one epigraph in a file that is
             # already its own chapter). Leave the original bytes untouched and just
-            # attach a ToC entry to it, rather than reconstructing/reserializing it.
+            # attach a ToC entry to it, rather than reconstructing/reserialising it.
             names = [z]
             origin[z] = z
             for i in collect_ids(root):
@@ -1863,7 +1863,7 @@ def cmd_apply(args):
                 names.append(nz)
             del new_files[z]
             for idx, (nz, proot) in enumerate(zip(names, parts)):
-                new_files[nz] = serialize_xhtml(proot)
+                new_files[nz] = serialise_xhtml(proot)
                 origin[nz] = z
                 for i in collect_ids(proot):
                     id_map[(z, i)] = nz
@@ -1958,9 +1958,9 @@ def cmd_apply(args):
                         changed = True
         if changed:
             if zname.lower().endswith(".ncx"):
-                new_files[zname] = serialize_xml(r)
+                new_files[zname] = serialise_xml(r)
             else:
-                new_files[zname] = serialize_xhtml(r)
+                new_files[zname] = serialise_xhtml(r)
 
     # ---- OPF: manifest + spine --------------------------------------------
     opf = book.opf
@@ -2037,14 +2037,14 @@ def cmd_apply(args):
             pl = r.find(NCX + "pageList")
             if pl is not None:
                 r.remove(pl)
-                new_files[ncx_it["zip"]] = serialize_xml(r)
+                new_files[ncx_it["zip"]] = serialise_xml(r)
         nav_it = book.nav_item()
         if nav_it is not None and nav_it["zip"] in new_files:
             r = parse_xml(new_files[nav_it["zip"]])
             for n in list(r.iter(XH + "nav")):
                 if (n.get(EPUB + "type") or "") == "page-list":
                     n.getparent().remove(n)
-            new_files[nav_it["zip"]] = serialize_xhtml(r)
+            new_files[nav_it["zip"]] = serialise_xhtml(r)
 
     # ---- carry over ToC entries whose target survived intact ---------------
     carried: list[dict] = []
@@ -2115,7 +2115,7 @@ def cmd_apply(args):
         if ncx_it is not None and ncx_it["zip"] in new_files:
             rebuild_ncx(new_files, ncx_it["zip"], toc_entries)
 
-    new_files[book.opf_path] = serialize_xml(opf)
+    new_files[book.opf_path] = serialise_xml(opf)
 
     # ---- write -------------------------------------------------------------
     out = Path(args.out)
@@ -2462,7 +2462,7 @@ def rebuild_nav(files: dict, nav_zip: str, entries: list[dict]):
         return idx
 
     build(target, 0, min(e["level"] for e in entries))
-    files[nav_zip] = serialize_xhtml(root)
+    files[nav_zip] = serialise_xhtml(root)
 
 
 def rebuild_ncx(files: dict, ncx_zip: str, entries: list[dict]):
@@ -2511,7 +2511,7 @@ def rebuild_ncx(files: dict, ncx_zip: str, entries: list[dict]):
         return idx
 
     build(navmap, 0, min(e["level"] for e in entries))
-    files[ncx_zip] = serialize_xml(root)
+    files[ncx_zip] = serialise_xml(root)
 
 
 # --------------------------------------------------------------------------
