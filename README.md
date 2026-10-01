@@ -21,6 +21,8 @@ Built for a specific annoyance: you buy an ebook, load it onto a Kobo, and the p
   - [`cover`](#cover)
   - [`verify`](#verify)
 - [The plan file](#the-plan-file)
+  - [How levels are inferred](#how-levels-are-inferred)
+  - [Cover and title page entries](#cover-and-title-page-entries)
 - [Producer recipes](#producer-recipes)
 - [Recipes](#recipes)
 - [Verifying the result](#verifying-the-result)
@@ -71,9 +73,15 @@ uv run epubfix.py verify "book-fixed.epub" "book.epub"
 ```
 
 `--auto` looks at which paragraph style tends to be followed by the first
-paragraph of a chapter, and proposes the two or three markers that behave that
-way. It prints each proposal as the explicit command line that would reproduce
-it, so you can take one, adjust a regex and re-run by hand.
+paragraph of a chapter, and proposes the markers that behave that way. It also
+looks for a rarer part marker that leads into runs of chapters, nests chapters
+under it, keeps front and back matter outside the parts, and pulls a part
+epigraph printed *above* its part heading into that part's file.
+
+It then prints an **equivalent manual command** — the explicit flags that
+replay the plan exactly — so you can take it, adjust one regex and re-run by
+hand. Both paths share one scoring engine, so the line is genuinely
+equivalent rather than an approximation.
 
 Without `--auto`, `scan` behaves as it always has: `h1`-`h4`, or whatever you
 pass to `--select`, `--class-regex` and `--id-regex`.
@@ -97,7 +105,7 @@ uv run epubfix.py scan BOOK.epub -o plan.json [options]
 | `--no-tags` | Ignore `--select` entirely; match only on class or id. |
 | `--class-regex` | Treat elements whose `@class` matches as headings. |
 | `--id-regex` | Treat elements carrying (or containing) a matching `@id` as headings. |
-| `--require-following` | Mark a candidate `"split": false` unless the very next block's class matches. |
+| `--require-following` | Mark a candidate `"split": false` unless the block after it matches. "After" skips the heading's own `--title-extend` lines, and a following heading also passes, so part headings are not rejected. |
 | `--include-preceding` | Pull matching blocks immediately *before* a split point into its file. |
 | `--include-preceding-into` | Restrict `--include-preceding` to split points whose own class matches. |
 | `--title-extend` | Fold following sibling blocks' text into the ToC title. |
@@ -272,7 +280,11 @@ overlap identifies the family reliably where equality would never match at all.
 
 ## The plan file
 
-Plain JSON, meant to be read and edited. One entry per candidate:
+Plain JSON, meant to be read and edited.
+
+Levels and the cover and title page entries are decided by `scan` and only read by `apply`, so **re-run `scan` after updating the script**. A plan from an older version still applies, but with the old decisions; `apply` warns when the plan's `plan_version` is out of date.
+
+One entry per candidate:
 
 ```json
 {
@@ -296,10 +308,57 @@ Plain JSON, meant to be read and edited. One entry per candidate:
 | `class`, `tag`, `id`, `depth` | Identifying context, so you can bulk-edit by find-and-replace. |
 | `score`, `why` | Confidence in [0,1] and the reasoning behind it. Informational — `apply` reads `split`. |
 | `split` | **Edit this.** `false` leaves the text in place and creates no entry. |
-| `level` | **Edit this.** `1` for top-level, `2` to nest under the preceding level-1 entry. |
+| `level` | **Edit this.** `1` for top-level, `2` to nest under the preceding level-1 entry. Pre-filled by [inference](#how-levels-are-inferred). |
 | `title` | **Edit this.** The table-of-contents label. |
 
 Because `class` is included in every record, disabling a whole category of false positives is usually a single find-and-replace in your editor rather than 50 individual edits.
+
+### Cover and title page entries
+
+Two more keys cover the front of the book, which otherwise has no ToC entry even though it is already its own file:
+
+```json
+{
+  "cover": { "file": "OEBPS/cover.xhtml", "title": "Cover" },
+  "documents": [
+    { "file": "OEBPS/Gallipoli_Soup.xhtml", "leading_title": "Title Page", "candidates": [ ... ] }
+  ]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `cover` | Written when the page that displays the cover image is not already in the publisher's ToC. |
+| `leading_title` | Written per document when content precedes its first split point. That content — title, imprint, dedication — becomes its own file; this names it. `"Title Page"` when it carries the book's title, otherwise its first line. |
+
+`scan` lists both under **Front matter**. Blank a title to leave that entry out. Neither is ever renumbered by `--title-format`.
+
+To give the copyright page and dedication their own entries as well, take the equivalent command `--auto` printed and add their styles to its class regex. In an InDesign export they are usually one-off styles such as `Imprint-1st-line` and `Dedication-first-line`, which `classes` will show:
+
+```bash
+uv run epubfix.py scan "book.epub" -o plan.json --no-tags \
+  --class-regex "^Part-Number$|^_-Chapter-Number$|^Imprint-1st-line$|^Dedication-first-line$" \
+  --title-extend "^Part-Name$|^_-Chapter-Date$|^_-Chapter-Name$" \
+  --include-preceding "^Intro-quote$|^Intro-quote-1st ParaOverride-14$|^Intro-quote-1st$" \
+  --include-preceding-into "^Part-Number$"
+```
+
+They will usually score below the threshold, since a list of imprint lines does not read like a chapter, so in the plan set each one's `"split"` to `true` and its `"title"` to `"Copyright"` and `"Dedication"`. Level inference ignores one-off styles, so adding them does not disturb the part nesting.
+
+### How levels are inferred
+
+When the chosen markers use two styles and the rarer one consistently leads into runs of the denser one — three `Part-Number` headings each followed by chapters — the rarer becomes level 1 and the denser nests beneath it.
+
+Style alone cannot finish the job, because publishers routinely give front and back matter the chapter heading style. So position decides the edges:
+
+- anything **before the first part** is outside the parts, and stays at level 1;
+- **after the last part**, chapters continue and then stop. The entries between two parts are known chapters, so their typical shape — style, how many continuation lines follow, whether they read "Chapter N" — says what a chapter looks like. The first trailing entry that breaks that shape starts the back matter, and everything after it stays at level 1.
+
+Entries *between* parts always stay nested: an interlude in the middle of a part is still in that part.
+
+The limit: if chapters are named rather than numbered *and* have no continuation lines, an "Afterword" in the same style looks exactly like a chapter, and is nested in the last part. Fix it in the plan by setting its `level` to `1`.
+
+`apply` also refuses to let an entry nest under anything but a genuinely shallower entry. A level-2 entry with nothing above it goes to the top level beside its fellow orphans, rather than the first orphan adopting the rest.
 
 ---
 
@@ -311,10 +370,12 @@ Because `class` is included in every record, disabling a whole category of false
 uv run epubfix.py scan "book.epub" --auto -o plan.json
 ```
 
-On the three books this was developed against — a Gollancz SF Gateway title
-split on epigraphs, one already split but misnamed, and an InDesign export
-needing 114 splits and two ToC levels — `--auto` followed by `apply` reproduces
-the hand-made fix exactly, with no flags. That will not hold for every book,
+It was developed against three books: a Gollancz SF Gateway title split on
+epigraphs, one already split but collapsed into a single ToC entry, and an
+InDesign export needing 114 splits and two ToC levels. On replicas built from
+those books' style statistics, `--auto` followed by `apply` reproduces the
+hand-made structure with no flags. The real books are the arbiter — see
+[Regression tests](#regression-tests) — and it will not hold for every book,
 which is why the plan file still exists.
 
 **Real headings, straightforward book**
@@ -337,6 +398,8 @@ uv run epubfix.py scan "book.epub" -o plan.json \
 ```
 
 Here the chapter title is split across three sibling paragraphs (number, POV character, date), so `--title-extend` folds them into one label. Part epigraphs are printed above their part heading, so `--include-preceding` pulls them into the part's file — scoped with `--include-preceding-into` so a closing epigraph elsewhere in the book stays where it is.
+
+`--auto` arrives at an equivalent of this command by itself and prints it. The same publisher also gives "Author's note", "Cast", "Acknowledgements" and the like the chapter heading style; they stay at level 1, outside the parts — see [How levels are inferred](#how-levels-are-inferred).
 
 **Gollancz / SF Gateway** — chapters marked only by an epigraph `div`
 
@@ -396,7 +459,8 @@ If you use the KoboTouchExtended driver, turn on its option to copy the generate
 **Limitations:**
 
 - No DRM handling of any kind. The book must open in Calibre's editor.
-- Chapter detection proposes; it does not decide. `--auto` is good enough to reproduce three hand-made fixes exactly, but publishers are inconsistent and a wrong split silently corrupts structure, so the plan file still exists and is still worth reading. The confidence scores exist to tell you *where* to look, not to spare you looking.
+- Chapter detection proposes; it does not decide. Publishers are inconsistent and a wrong split silently corrupts structure, so the plan file still exists and is still worth reading. The confidence scores exist to tell you *where* to look, not to spare you looking.
+- `--auto` finds markers by what follows them, and deliberately ignores the dominant body style as a follower. A book whose chapters are plain `<h2>` headings opening straight into ordinary paragraphs is invisible to it; plain `scan` with no flags handles that case.
 - The scoring was tuned against three books. It is a considered set of features rather than a fitted model, but three books is three books — run `verify`, and read the low-confidence end of the plan.
 - Split points must be siblings within the same parent for `--include-preceding` and `--require-following` to work, which is the normal case but not guaranteed.
 - `image_size` understands PNG, JPEG, and GIF. A WebP or SVG cover will be swapped in but its SVG wrapper will not be resized.

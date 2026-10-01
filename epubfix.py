@@ -450,6 +450,7 @@ class StyleStats:
         # descendant block styles, counted once per occurrence of the outer
         # style: used to ask "does this epigraph carry an attribution line?"
         self.contains: dict[tuple[str, str], dict[tuple[str, str], int]] = {}
+        self.texted: dict[tuple[str, str], int] = {}
         self.total = 0
 
     def add_document(self, body):
@@ -457,6 +458,8 @@ class StyleStats:
             sig = style_of(el)
             t = text_of(el)
             self.counts[sig] = self.counts.get(sig, 0) + 1
+            if t.strip():
+                self.texted[sig] = self.texted.get(sig, 0) + 1
             self.lengths.setdefault(sig, []).append(len(t))
             self.total += 1
             s = self.samples.setdefault(sig, [])
@@ -515,6 +518,10 @@ class StyleStats:
             return 0.0
         inner = self.contains.get(sig, {})
         return min(1.0, sum(inner.get(a, 0) for a in attrib) / n)
+
+    def texted_share(self, sig) -> float:
+        """Share of this style's occurrences that contain any text at all."""
+        return self.texted.get(sig, 0) / max(self.counts.get(sig, 0), 1)
 
     def chapterish_fraction(self, sig) -> float:
         s = self.samples.get(sig, [])
@@ -576,13 +583,17 @@ def follower_styles(opener, chain: list, stats: StyleStats) -> set:
     Text-Drop-2 depending on whether the drop cap needs a different indent, and
     treating either as "not the expected paragraph" would mark half the real
     chapters as doubtful. Requiring a decent share of the marker's occurrences
-    keeps the set to genuine chapter openings. The dominant body style is
+    keeps the set to genuine chapter openings - but the bar has to sit low.
+    In the book that motivated this, Text-Drop-2 opens 14 of 116 chapters
+    (12%): a 15% bar silently excluded exactly the case it was written for,
+    and a printed --require-following then disabled those 14 chapters. A
+    one-off is still kept out by the absolute floor of two. The dominant body style is
     always excluded: "followed by ordinary body text" is the null hypothesis,
     true of every mid-scene quotation in the book, so admitting it would let
     the set match everything and discriminate nothing.
     """
     tail = chain[-1] if chain else opener
-    need = max(2, 0.15 * stats.counts.get(opener, 0))
+    need = max(2, 0.05 * stats.counts.get(opener, 0))
     dominant = stats.dominant()
     return {b for (a, b), n in stats.bigrams.items()
             if a == tail and b != dominant and n >= need and stats.is_body_like(b)}
@@ -611,6 +622,12 @@ def propose_selectors(stats: StyleStats, limit: int = 5) -> list[dict]:
         # otherwise outrank the real one.
         if not stats.has_letters(a):
             score *= 0.3
+        # A heading that is empty almost every time cannot label anything, and
+        # every empty candidate is later scored zero - so choosing it produced a
+        # plan with no split points at all. Gollancz files each open with an
+        # empty <h1 class="chapter-title"> whose only non-empty use is
+        # "Contents", which is enough to pass has_letters but not this.
+        score *= stats.texted_share(a)
         # "Chapter 7", a bare numeral or a roman numeral is near-conclusive.
         score *= 1.0 + 2.0 * stats.chapterish_fraction(a)
 
@@ -640,21 +657,180 @@ def propose_selectors(stats: StyleStats, limit: int = 5) -> list[dict]:
     return kept[:limit]
 
 
-def proposal_command(p: dict) -> str:
-    """The explicit scan invocation equivalent to a proposal.
+def rx_literal(text: str) -> str:
+    """Escape only what a regex treats specially, so printed commands stay legible.
+
+    re.escape also escapes '-' and ' ', turning _-Chapter-Number into
+    _\\-Chapter\\-Number. Both are inert outside a character class, and the
+    whole point of printing a command is that a person reads and edits it.
+    """
+    return re.sub(r"([.^$*+?{}\[\]\\|()])", r"\\\1", text)
+
+
+def anchored_rx(sigs) -> str:
+    """One alternation matching exactly these class attributes, nothing looser.
+
+    Anchoring matters: an unanchored "blockquote" also matches "blockquote1",
+    the verse styling used INSIDE a Gollancz epigraph.
+    """
+    return "|".join(sorted({"^" + rx_literal(s[1]) + "$" if s[1] else "^$" for s in sigs}))
+
+
+def manual_command(openers, chain, absorb=(), parents=()) -> str:
+    """The manual scan flags that replay a set of --auto decisions.
 
     --auto prints this so it stays a suggestion engine rather than a black box:
-    you can copy the line, adjust one regex, and re-run by hand.
+    copy the line, adjust one regex, re-run by hand. That only works if the
+    line is genuinely equivalent, which is why the manual path derives the
+    same scoring model from these flags (see derive_model) instead of being
+    handed a hard --require-following filter. An earlier version printed one
+    marker plus --require-following; run verbatim it disabled every chapter,
+    because a hard filter looks at the very next block, which for a three-line
+    heading is the heading's own second line.
     """
-    def anchored(sig):
-        return "^" + re.escape(sig[1]) + "$" if sig[1] else "^$"
-    bits = ["--no-tags", f'--class-regex "{anchored(p["opener"])}"']
-    if p["chain"]:
-        bits.append('--title-extend "%s"' % "|".join(anchored(s) for s in p["chain"]))
-    if p["followers"]:
-        bits.append('--require-following "%s"'
-                    % "|".join(sorted(anchored(f) for f in p["followers"])))
+    bits = ["--no-tags", f'--class-regex "{anchored_rx(openers)}"']
+    if chain:
+        bits.append(f'--title-extend "{anchored_rx(chain)}"')
+    if absorb and parents:
+        bits.append(f'--include-preceding "{anchored_rx(absorb)}"')
+        bits.append(f'--include-preceding-into "{anchored_rx(parents)}"')
     return " ".join(bits)
+
+
+def proposal_command(p: dict) -> str:
+    """The command for one proposal on its own, ignoring any part markers."""
+    return manual_command({p["opener"]}, p["chain"])
+
+
+def _bodies(book: "Epub"):
+    for it in book.spine_docs():
+        data = book.files.get(it["zip"])
+        if data is None:
+            continue
+        body = find_body(parse_xml(data))
+        if body is not None:
+            yield body
+
+
+def leads_into(book: "Epub", parent: dict, opener, window: int = 3) -> float:
+    """Share of a candidate part marker's occurrences that open a run of chapters.
+
+    "Rare, short and lettered" - all the original part filter checked - also
+    describes a table-of-contents entry and a bibliography subheading, and
+    both were adopted as part markers. What makes a part heading a part
+    heading is what comes after it: past its own continuation line and at
+    most an epigraph, a chapter heading. A contents list is followed by more
+    contents list.
+    """
+    sig, chain = parent["opener"], set(parent["chain"])
+    hits = total = 0
+    for body in _bodies(book):
+        for el in body.iter():
+            if not isinstance(el.tag, str) or style_of(el) != sig:
+                continue
+            total += 1
+            cur, steps = el, 0
+            while steps < window:
+                cur = next_block(cur)
+                if cur is None:
+                    break
+                if style_of(cur) in chain:
+                    continue
+                if style_of(cur) == opener:
+                    hits += 1
+                    break
+                steps += 1
+    return hits / total if total else 0.0
+
+
+def part_epigraph_styles(book: "Epub", stats: "StyleStats", parent_sigs: set,
+                         stop: set, window: int = 4) -> set:
+    """Styles that live directly above part headings - the part epigraph.
+
+    Gallipoli Soup prints each part's epigraph ABOVE "Part II / Into the Pot",
+    so cutting at the heading strands the quotes at the end of the previous
+    chapter. Rather than guess what an epigraph looks like, count where each
+    style occurs: a style found mostly in the few blocks above part headings
+    belongs to them. The same quote style also closes the book before the
+    Acknowledgements; that occurrence is left alone because absorption is
+    later scoped to part headings only.
+
+    Short label styles must be found ONLY there. The contents page sits right
+    above Part I in that book, and half its date lines would otherwise
+    qualify, dragging the tail of the contents list into Part I's file.
+    """
+    near: dict = {}
+    for body in _bodies(book):
+        for el in body.iter():
+            if not isinstance(el.tag, str) or style_of(el) not in parent_sigs:
+                continue
+            cur = el
+            for _ in range(window):
+                cur = prev_block(cur)
+                if cur is None or style_of(cur) in stop:
+                    break
+                near[style_of(cur)] = near.get(style_of(cur), 0) + 1
+    out = set()
+    for sig, n in near.items():
+        share = n / max(stats.counts.get(sig, 0), 1)
+        if share >= 1.0 or (share >= 0.5 and not stats.is_title_like(sig)):
+            out.add(sig)
+    return out
+
+
+def derive_model(book: "Epub", stats: "StyleStats", match, extend_re, attrib: set):
+    """Build, from manual flags, the same scoring model --auto builds for itself.
+
+    Without this the two paths scored candidates differently, so no command
+    --auto printed could ever replay its plan. Each matched style's
+    continuation lines are taken from what --title-extend actually folds in,
+    and its chapter-opening paragraph styles from the book's statistics,
+    exactly as --auto derives them.
+    """
+    seqs: dict = {}
+    for body in _bodies(book):
+        for i, el in enumerate(body.iter()):
+            if i == 0 or not isinstance(el.tag, str) or not match(el):
+                continue
+            seq = []
+            if extend_re is not None:
+                for sib in el.itersiblings():
+                    if not isinstance(sib.tag, str) or not extend_re.search(sib.get("class") or ""):
+                        break
+                    seq.append(style_of(sib))
+            d = seqs.setdefault(style_of(el), {})
+            d[tuple(seq)] = d.get(tuple(seq), 0) + 1
+    openers, chain_styles, followers = set(seqs), set(), set()
+    for sig, d in seqs.items():
+        chain = list(max(d.items(), key=lambda kv: kv[1])[0])
+        chain_styles |= set(chain)
+        followers |= follower_styles(sig, chain, stats)
+    main = max(openers, key=lambda x: stats.counts.get(x, 0)) if openers else None
+    rate = stats.attribution_rate(main, attrib) if main else 0.0
+    return openers, chain_styles, followers, 0.35 <= rate <= 0.97
+
+
+def extension_depth(el, extend_styles: set, extend_re) -> int:
+    """How many continuation lines were folded into this candidate's title.
+
+    Recorded because it is the cleanest structural difference between a
+    chapter and back matter that shares its heading style: "Chapter 61" is
+    followed by a POV name and a date; "Acknowledgements" by nothing.
+    """
+    n = 0
+    if extend_styles:
+        cur = el
+        while True:
+            cur = next_block(cur)
+            if cur is None or style_of(cur) not in extend_styles:
+                return n
+            n += 1
+    if extend_re is not None:
+        for sib in el.itersiblings():
+            if not isinstance(sib.tag, str) or not extend_re.search(sib.get("class") or ""):
+                break
+            n += 1
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -708,7 +884,8 @@ def effective_follower(el, chain: set):
 
 
 def score_candidate(el, stats: StyleStats, chain: set, followers: set,
-                    breaks: set, attrib: set, use_attrib: bool) -> tuple[float, str]:
+                    breaks: set, attrib: set, use_attrib: bool,
+                    openers: set = frozenset()) -> tuple[float, str]:
     """Confidence in [0,1] that this element opens a chapter, plus why.
 
     Returns a reason string so a low score can be argued with rather than
@@ -724,7 +901,14 @@ def score_candidate(el, stats: StyleStats, chain: set, followers: set,
     nxt = effective_follower(el, chain)
 
     is_prose = nxt is not None and stats.is_body_like(style_of(nxt))
-    if followers:
+    # The follower test exists to separate a chapter epigraph from a song a
+    # character overhears, which share a generic quotation style. A short
+    # heading-shaped style has no such ambiguity: when "Acknowledgements" uses
+    # the same style as "Chapter 7", the publisher has declared it a heading,
+    # and penalising it for opening with ordinary prose instead of a drop cap
+    # silently merged all front and back matter into the nearest chapter.
+    label = stats.is_title_like(style_of(el)) and stats.has_letters(style_of(el))
+    if followers and not label:
         # The book has a distinct "first paragraph of a chapter" style. Prose in
         # any OTHER style is therefore positive evidence that this marker sits
         # mid-scene - which is exactly what separates a chapter epigraph from a
@@ -742,9 +926,17 @@ def score_candidate(el, stats: StyleStats, chain: set, followers: set,
             # is.
             score -= 0.30
             reasons.append("not followed by prose")
+    elif nxt is not None and style_of(nxt) in followers:
+        score += 0.45
+        reasons.append(f"opens with {style_label(style_of(nxt))}")
     elif is_prose:
         score += 0.40
         reasons.append("followed by prose")
+    elif nxt is not None and style_of(nxt) in openers:
+        # A part heading is followed by a chapter heading, not by prose. That
+        # is the defining shape of a part, so it is evidence for, not against.
+        score += 0.40
+        reasons.append("opens a run of chapters")
     else:
         reasons.append("not followed by prose")
 
@@ -787,6 +979,14 @@ def score_candidate(el, stats: StyleStats, chain: set, followers: set,
     # to every candidate would change no ordering at all. This is what keeps
     # front matter whose body is a list or a poem, rather than prose ("Cast",
     # "Contents", "Let's Remember"), in the table of contents.
+    if label and score < 0.55:
+        # Same reasoning as the stylesheet floor below, and for the same kind of
+        # content: "Contents", "Bibliography" and a closing poem open with a
+        # list or verse rather than prose. Without page-break CSS to rescue
+        # them they all fell under the threshold.
+        reasons.append("same heading style as the chapters")
+        score = 0.55
+
     cls = el.get("class") or ""
     if cls and cls in breaks:
         if score < 0.55:
@@ -837,6 +1037,10 @@ def titles_are_prose(titles: list[str]) -> bool:
     return long_ones / len(real) > 0.5
 
 
+def child_signature(c: dict) -> tuple:
+    return (c["tag"], c["class"], c.get("ext", 0), bool(CHAPTERISH.match(c.get("text", ""))))
+
+
 def infer_levels(cands: list[dict]) -> None:
     """Assign level 1/2 in place, from how the marker styles interleave.
 
@@ -844,15 +1048,36 @@ def infer_levels(cands: list[dict]) -> None:
     rare one is the shallower level, but only if it actually behaves like a
     parent - each occurrence followed by a run of the denser marker. Otherwise
     the two are siblings and everything stays level 1.
+
+    Class alone cannot finish the job. Publishers routinely give front and
+    back matter the chapter heading style, so a class-only rule nested
+    "Acknowledgements" inside Part III and, with nothing above it to nest
+    under, left "Author's note" as a phantom parent of the front matter. Both
+    are outside the parts, which is a fact about position, not style:
+
+      - anything before the first part cannot be inside a part;
+      - after the last part, chapters continue for a while and then stop. The
+        entries between two parts are known chapters, so their typical shape
+        (style, continuation lines, whether they read "Chapter N") says what
+        a chapter looks like; the first trailing entry that breaks that shape
+        is where the back matter starts, and everything after it is back
+        matter too.
+
+    Entries BETWEEN parts stay nested even if they look different: an
+    interlude in the middle of a part is still in that part.
     """
     groups: dict[tuple, list[dict]] = {}
     for c in cands:
         groups.setdefault((c["tag"], c["class"]), []).append(c)
-    if len(groups) < 2:
+    # A style used once cannot be a level of hierarchy. Without this, adding a
+    # single extra split point - the copyright page's "Imprint-1st-line" - made
+    # that one-off the "rarer marker", failed the two-or-more check, and
+    # silently flattened the whole book.
+    eligible = [kv for kv in groups.items() if len(kv[1]) >= 2]
+    if len(groups) < 2 or not eligible:
         return
-    ranked = sorted(groups.items(), key=lambda kv: len(kv[1]))
-    rare_key, rare = ranked[0]
-    dense_total = sum(len(v) for k, v in ranked[1:])
+    rare_key, rare = min(eligible, key=lambda kv: len(kv[1]))
+    dense_total = sum(len(v) for k, v in groups.items() if k != rare_key)
     if len(rare) < 2 or dense_total < 3 * len(rare):
         return
     order = sorted(cands, key=lambda c: (c["doc_index"], c["pos"]))
@@ -869,6 +1094,23 @@ def infer_levels(cands: list[dict]) -> None:
         return
     for c in cands:
         c["level"] = 1 if id(c) in rare_ids else 2
+
+    marks = [k for k, c in enumerate(order) if id(c) in rare_ids]
+    for c in order[:marks[0]]:
+        c["level"] = 1
+    inside = [c for c in order[marks[0] + 1:marks[-1]] if id(c) not in rare_ids]
+    if not inside:
+        return
+    shapes: dict = {}
+    for c in inside:
+        shapes[child_signature(c)] = shapes.get(child_signature(c), 0) + 1
+    typical = max(shapes.items(), key=lambda kv: kv[1])[0]
+    leaving = False
+    for c in order[marks[-1] + 1:]:
+        if not leaving and child_signature(c) != typical:
+            leaving = True
+        if leaving:
+            c["level"] = 1
 
 
 def existing_toc(book: Epub) -> list[dict]:
@@ -1113,7 +1355,10 @@ def cmd_scan(args):
         print(f"   ... and {len(toc)-12} more")
 
     # ---- proposals ---------------------------------------------------------
-    proposals = [] if args.from_toc else propose_selectors(stats)
+    # Searched wider than displayed: a part marker can rank below unrelated
+    # styles on raw score (scene-break dingbats outrank it in an InDesign book)
+    # and still be exactly the parent of the winner.
+    proposals = [] if args.from_toc else propose_selectors(stats, limit=15)
     chosen = None
     parents: list[dict] = []
     if args.auto or args.propose:
@@ -1121,7 +1366,7 @@ def cmd_scan(args):
               f"{style_label(stats.dominant()) if stats.dominant() else 'n/a'}):")
         if not proposals:
             print("   none - no style reliably precedes body text. Try 'classes'.")
-        for k, p in enumerate(proposals, 1):
+        for k, p in enumerate(proposals[:5], 1):
             chain = " -> ".join(style_label(s) for s in p["chain"])
             print(f"  {k}. score {p['score']:8.2f}  {p['count']:>4} x {style_label(p['opener'])}"
                   + (f" -> {chain}" if chain else "")
@@ -1149,7 +1394,8 @@ def cmd_scan(args):
             for p in proposals[1:]:
                 if (stats.is_title_like(p["opener"])
                         and 2 <= p["count"] <= max(2, chosen["count"] // 5)
-                        and stats.has_letters(p["opener"])):
+                        and stats.has_letters(p["opener"])
+                        and leads_into(book, p, chosen["opener"]) >= 0.8):
                     parents.append(p)
 
     if args.auto and chosen is None:
@@ -1172,13 +1418,21 @@ def cmd_scan(args):
 
         extend_re = None
         extend_styles = chain_styles
+        parent_sigs = {p["opener"] for p in parents}
+        absorb = set()
+        if parents and not args.include_preceding:
+            stop = {stats.dominant()} | openers | chain_styles | followers
+            absorb = part_epigraph_styles(book, stats, parent_sigs, stop)
+            if absorb:
+                args.include_preceding = anchored_rx(absorb)
+                args.include_preceding_into = anchored_rx(parent_sigs)
+        print("\nEquivalent manual command for the plan below (replays it exactly):")
+        print("   " + manual_command(openers, chain_styles, absorb, parent_sigs))
     else:
         match = build_matcher("" if args.no_tags else args.select, args.class_regex, args.id_regex)
         extend_re = re.compile(args.title_extend, re.I) if args.title_extend else None
         extend_styles = set()
-        followers = set()
-        use_attrib = False
-        chain_styles = set()
+        openers, chain_styles, followers, use_attrib = derive_model(book, stats, match, extend_re, attrib)
 
     pre_re = re.compile(args.include_preceding, re.I) if args.include_preceding else None
     req_re = re.compile(args.require_following, re.I) if args.require_following else None
@@ -1232,10 +1486,15 @@ def cmd_scan(args):
                 p = p.getparent()
 
             score, why = score_candidate(el, stats, chain_styles, followers,
-                                         breaks, attrib, use_attrib)
+                                         breaks, attrib, use_attrib, openers)
             if req_re is not None:
-                nxt = next_block(el)
-                ok = nxt is not None and bool(req_re.search(nxt.get("class") or ""))
+                # Test the block after the heading's own continuation lines, and
+                # let a heading that leads straight into another heading pass:
+                # testing the immediately-next block rejects every multi-line
+                # heading, and every part heading, by construction.
+                nxt = effective_follower(el, chain_styles)
+                ok = nxt is not None and (bool(req_re.search(nxt.get("class") or ""))
+                                          or style_of(nxt) in openers)
                 why = "--require-following: " + ("matched" if ok else "no match")
             else:
                 ok = score >= args.threshold
@@ -1259,6 +1518,7 @@ def cmd_scan(args):
                 "split": ok,
                 "level": 1,
                 "title": clean_title(title)[:200] or "Untitled",
+                "ext": extension_depth(el, extend_styles, extend_re),
             })
         all_cands.extend(cands)
         plan["documents"].append({
@@ -1282,6 +1542,28 @@ def cmd_scan(args):
         if len(want) > 3 and len(want) > 1.5 * max(len(got), 1):
             print("  The book's own navigation is more detailed than the "
                   "detected headings; --from-toc will use it instead.")
+
+    # ---- front matter: the cover page and the content before the first cut -
+    # Both are already separate files; what they lacked was a ToC entry. They
+    # are written into the plan rather than added silently by `apply`, so they
+    # can be renamed or deleted like any other decision.
+    listed = set()
+    for e in toc:
+        target = urldefrag(e["href"])[0]
+        src = book.nav_item() or book.ncx_item()
+        base = str(PurePosixPath(src["zip"]).parent) if src else ""
+        listed.add(posix_join("" if base == "." else base, target))
+    cover_zip = cover_page(book)
+    if cover_zip and cover_zip not in listed:
+        plan["cover"] = {"file": cover_zip, "title": "Cover"}
+    for d in plan["documents"]:
+        cuts = [c["pos"] for c in d["candidates"] if c["split"]]
+        if not cuts or min(cuts) <= 1:
+            continue
+        body = find_body(parse_xml(book.files[d["file"]]))
+        lt = leading_title(book, list(body.iter()), min(cuts))
+        if lt:
+            d["leading_title"] = lt
 
     # ---- levels and titles -------------------------------------------------
     infer_levels([c for c in all_cands if c["split"]])
@@ -1314,15 +1596,26 @@ def cmd_scan(args):
 
     for c in all_cands:
         c.pop("doc_index", None)
+        c.pop("ext", None)
 
     print(f"\nTotal split points: {total}   (lines prefixed '-' are in the plan but disabled; "
           f"flip \"split\" to enable)")
+    if plan.get("cover"):
+        print(f"Front matter   : \"{plan['cover']['title']}\" -> {plan['cover']['file']}")
+    for d in plan["documents"]:
+        if d.get("leading_title"):
+            print(f"Front matter   : \"{d['leading_title']}\" -> content of {d['file']} before its first split")
+    if plan.get("cover") or any(d.get("leading_title") for d in plan["documents"]):
+        print("                 (plan keys \"cover\" and \"leading_title\"; blank a title to leave it out)")
     if numbering:
         print("Titles look like opening prose rather than chapter names; "
               'plan sets title_format "Chapter {n}". Remove it to keep the detected text.')
     levels = sorted({c["level"] for c in all_cands if c["split"]})
     if len(levels) > 1:
-        print(f"Levels inferred: {levels} (rarer marker nested as level 1)")
+        on = [c for c in all_cands if c["split"]]
+        nested = sum(1 for c in on if c["level"] == 2)
+        print(f"Levels inferred: {len(on) - nested} at level 1, {nested} nested under them. "
+              f"Front and back matter outside the parts stays at level 1.")
 
     if args.propose and not args.auto:
         print("\nProposals only - no plan written. Re-run with --auto to use proposal 1.")
@@ -1486,6 +1779,60 @@ def find_cover(book: "Epub"):
                         if it["zip"] == z and it["media"].startswith("image/"):
                             return it, f"image referenced by the first spine document ({first['zip']})"
     return None, "no cover image could be identified"
+
+
+def cover_page(book: "Epub") -> str | None:
+    """The spine document that displays the cover image, if any."""
+    item, _how = find_cover(book)
+    if item is None:
+        return None
+    for it in book.spine_docs():
+        try:
+            r = parse_xml(book.files[it["zip"]])
+        except Exception:
+            continue
+        base_dir = str(PurePosixPath(it["zip"]).parent)
+        if base_dir == ".":
+            base_dir = ""
+        for el in r.iter():
+            if not isinstance(el.tag, str):
+                continue
+            for attr in ("src", "href", "{%s}href" % NS["xlink"]):
+                v = el.get(attr)
+                if v and posix_join(base_dir, v) == item["zip"]:
+                    return it["zip"]
+    return None
+
+
+def book_title(book: "Epub") -> str:
+    meta = book.opf.find(OPF + "metadata")
+    el = meta.find("{%s}title" % NS["dc"]) if meta is not None else None
+    return text_of(el) if el is not None else ""
+
+
+def leading_title(book: "Epub", elems: list, first_cut: int) -> str | None:
+    """A ToC label for the content before a document's first split point.
+
+    That content - title page, imprint, dedication - becomes its own file
+    when the document is split, which is right for Kobo's progress tracking,
+    but it was left out of the table of contents entirely. A reader could
+    only reach the copyright page by paging backwards from Chapter 1.
+
+    "Title Page" when the segment carries the book's own title, which is what
+    such a block nearly always opens with; otherwise its first line, so a
+    segment that is unexpectedly something else is visibly so in the plan.
+    Returns None when there is nothing there, or when the segment is only the
+    cover image - the cover gets its own entry.
+    """
+    texts = [(e.text or "").strip() for e in elems[1:first_cut] if isinstance(e.tag, str)]
+    texts = [t for t in texts if t]
+    if not texts:
+        return None
+    joined = " ".join(texts).lower()
+    title = book_title(book).strip().lower()
+    if title and title in joined:
+        return "Title Page"
+    return clean_title(texts[0])[:60] or None
 
 
 def cmd_cover(book_path, image_path, out_path):
@@ -1873,6 +2220,9 @@ def cmd_apply(args):
         # preceded the first cut it became segment 0, so the headings start one
         # index later; `leading` tracks that.
         offset = 1 if leading else 0
+        if leading and entry and (entry.get("leading_title") or "").strip():
+            toc_entries.append({"level": 1, "title": entry["leading_title"].strip(),
+                                "zip": names[0], "frag": "", "fixed": True})
         for k, c in enumerate(chosen):
             toc_entries.append({
                 "level": int(c.get("level", 1)),
@@ -2048,17 +2398,17 @@ def cmd_apply(args):
 
     # ---- carry over ToC entries whose target survived intact ---------------
     carried: list[dict] = []
+    spine_pos: dict[str, int] = {}
+    seq = 0
+    for idref in book.spine:
+        it = book.items.get(idref)
+        if it is None:
+            continue
+        for nz in file_map.get(it["zip"], [it["zip"]]):
+            if nz not in spine_pos:
+                spine_pos[nz] = seq
+                seq += 1
     if not args.rebuild_toc_only:
-        spine_pos: dict[str, int] = {}
-        seq = 0
-        for idref in book.spine:
-            it = book.items.get(idref)
-            if it is None:
-                continue
-            for nz in file_map.get(it["zip"], [it["zip"]]):
-                if nz not in spine_pos:
-                    spine_pos[nz] = seq
-                    seq += 1
 
         kept = []
         for e in existing_toc(book):
@@ -2089,6 +2439,18 @@ def cmd_apply(args):
                                        0 if e in kept else 1))
             toc_entries = merged
 
+    # ---- the cover page ----------------------------------------------------
+    cov = plan.get("cover") or {}
+    if (cov.get("title") or "").strip() and cov.get("file") in file_map:
+        target = file_map[cov["file"]][0]
+        if target not in {e["zip"] for e in toc_entries}:
+            toc_entries.append({"level": 1, "title": cov["title"].strip(),
+                                "zip": target, "frag": "", "fixed": True})
+    # Generated entries are already in reading order, but carried and front-
+    # matter entries are not, so order everything by spine position. The sort
+    # is stable, so entries within one file keep their relative order.
+    toc_entries.sort(key=lambda e: spine_pos.get(e["zip"], 1 << 30))
+
     # ---- optional sequential titles ---------------------------------------
     # An explicit --title-format wins; otherwise honour the one `scan` recorded
     # after finding the book's headings were really its opening prose.
@@ -2101,13 +2463,16 @@ def cmd_apply(args):
         generated = {id(e) for e in toc_entries} - {id(e) for e in carried}
         n = 0
         for e in toc_entries:
-            if e.get("frag") or id(e) not in generated:
+            # "fixed" marks the cover and title-page entries: a Gollancz book
+            # numbered "Chapter {n}" must not turn its title page into Chapter 1.
+            if e.get("frag") or id(e) not in generated or e.get("fixed"):
                 continue
             n += 1
             e["title"] = title_format.format(n=n, text=e["title"])
 
     # ---- rebuild navigation ------------------------------------------------
     if toc_entries:
+        normalise_levels(toc_entries)
         nav_it = book.nav_item()
         if nav_it is not None and nav_it["zip"] in new_files:
             rebuild_nav(new_files, nav_it["zip"], toc_entries)
@@ -2262,15 +2627,37 @@ def spine_prose(book: Epub) -> str:
     and re-serialising turns &mdash; into the character it names. Neither
     changes a word, and neither should be reported as one.
     """
-    parts = []
+    # Every block boundary counts as whitespace, on both sides of the
+    # comparison. Joining whole documents with a space instead reported
+    # "PROSE CHANGED" for any book whose XHTML has no newline between
+    # </p><h2>: the original read "note 1.Chapter 2" and the split copy
+    # "note 1. Chapter 2". A split never moves text WITHIN a block, so this
+    # cannot hide a real change - a lost, duplicated or altered paragraph
+    # still differs.
+    out: list[str] = []
+
+    def walk(el):
+        is_block = isinstance(el.tag, str) and etree.QName(el).localname.lower() not in INLINE_TAGS
+        if is_block:
+            out.append(" ")
+        if isinstance(el.tag, str) and el.text:
+            out.append(el.text)
+        for child in el:
+            walk(child)
+        if is_block:
+            out.append(" ")
+        if el.tail:
+            out.append(el.tail)
+
     for it in book.spine_docs():
         data = book.files.get(it["zip"])
         if data is None:
             continue
         body = find_body(parse_xml(data))
         if body is not None:
-            parts.append(text_of(body))
-    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+            walk(body)
+            out.append(" ")
+    return re.sub(r"\s+", " ", "".join(out)).strip()
 
 
 def check_links(book: Epub) -> list[str]:
@@ -2416,6 +2803,25 @@ def cmd_verify(args):
         print("FAILED: " + "; ".join(failures))
         raise SystemExit(1)
     print("OK - all checks passed.")
+
+
+def normalise_levels(entries: list[dict]) -> None:
+    """Give every nested entry a real parent, in place.
+
+    An entry may only nest under the nearest preceding entry that is genuinely
+    shallower in the plan. One with no such entry is an orphan and goes to the
+    top level - alongside the other orphans, not beneath them. The builder used
+    to promote only the FIRST orphan, which then adopted every following one:
+    that is how "Author's note" came to contain "Cast" and "Contents". Levels
+    that skip (1 then 3) are closed up to consecutive depths the same way.
+    """
+    original = [e["level"] for e in entries]
+    eff: list[int] = []
+    for i, lvl in enumerate(original):
+        parent = next((j for j in range(i - 1, -1, -1) if original[j] < lvl), None)
+        eff.append(1 if parent is None else eff[parent] + 1)
+    for e, lvl in zip(entries, eff):
+        e["level"] = lvl
 
 
 def rebuild_nav(files: dict, nav_zip: str, entries: list[dict]):
